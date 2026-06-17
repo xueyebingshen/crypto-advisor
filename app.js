@@ -1,5 +1,5 @@
 // State Variables
-console.log("AI Crypto Trend Advisor - V3.11 Loaded successfully. Absolute clean console active.");
+console.log("AI Crypto Trend Advisor - V3.12 Loaded successfully. Breakout order logic optimized.");
 let activeToken = 'BTC';
 let currentPrice = 61000; // Initialize with sensible default immediately
 let fngValue = 50;
@@ -1962,6 +1962,13 @@ function syncBacktestOrders() {
       }
     } else {
       const order = port.pendingOrder;
+      
+      // For right-side breakout/breakdown (B and D), do not shift based on price fluctuations.
+      // They should remain locked at their initial placement price.
+      if ((letter === 'B' || letter === 'D') && order.symbol === activeToken) {
+        return;
+      }
+      
       const isShifted = order.symbol !== activeToken || 
                         Math.abs(order.entryPrice - lvl.entry) > 0.01 ||
                         Math.abs(order.sl - lvl.sl) > 0.01 ||
