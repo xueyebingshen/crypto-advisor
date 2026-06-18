@@ -1,5 +1,5 @@
 // State Variables
-console.log("AI Crypto Trend Advisor - V3.12 Loaded successfully. Breakout order logic optimized.");
+console.log("AI Crypto Trend Advisor - V3.14 Loaded successfully. Cloud Database Sync active.");
 let activeToken = 'BTC';
 let currentPrice = 61000; // Initialize with sensible default immediately
 let fngValue = 50;
@@ -24,6 +24,120 @@ let resetCounter = 0;
 let backtest = null;
 let activeAccountId = 'manual';
 
+// Supabase Cloud Configuration
+const SUPABASE_URL = "https://zhnpmuyryherlzrrfumk.supabase.co";
+const SUPABASE_KEY = "sb_publishable_OJar6H5OV0Qka4UuA0VLzA_U4Q5RzXf";
+let supabaseClient = null;
+
+if (typeof supabase !== 'undefined') {
+  try {
+    supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    console.log("[Supabase Client] Initialized successfully.");
+  } catch (e) {
+    console.error("[Supabase Client] Initialization failed:", e);
+  }
+} else {
+  console.warn("[Supabase Client] Library not loaded. Cloud sync is disabled.");
+}
+
+let isSyncingToSupabase = false;
+let hasPendingSync = false;
+
+async function syncStateToSupabase() {
+  if (!supabaseClient) return;
+  if (isSyncingToSupabase) {
+    hasPendingSync = true;
+    return;
+  }
+  
+  isSyncingToSupabase = true;
+  hasPendingSync = false;
+  
+  try {
+    const statusSpan = document.querySelector('.live-pulse span');
+    let originalText = "";
+    if (statusSpan) {
+      originalText = statusSpan.innerText;
+      statusSpan.innerText = "正在同步云端数据...";
+      statusSpan.style.color = "var(--color-primary)";
+    }
+
+    const { error } = await supabaseClient
+      .from('crypto_advisor_state')
+      .upsert({
+        id: 'default',
+        portfolio: portfolio,
+        backtest: backtest,
+        updated_at: new Date().toISOString()
+      });
+      
+    if (error) {
+      console.warn("[Supabase Sync] Upload failed:", error.message);
+      if (statusSpan) {
+        statusSpan.innerText = "云端同步失败 (已用本地缓存)";
+        statusSpan.style.color = "var(--color-warning)";
+        setTimeout(() => {
+          if (statusSpan.innerText.includes("同步")) {
+            statusSpan.innerText = originalText;
+            statusSpan.style.color = "var(--color-success)";
+          }
+        }, 3000);
+      }
+    } else {
+      console.log("[Supabase Sync] Upload succeeded.");
+      if (statusSpan) {
+        statusSpan.innerText = "云端数据已同步";
+        statusSpan.style.color = "var(--color-success)";
+        setTimeout(() => {
+          if (statusSpan.innerText.includes("云端")) {
+            statusSpan.innerText = originalText;
+            statusSpan.style.color = "var(--color-success)";
+          }
+        }, 2000);
+      }
+    }
+  } catch (e) {
+    console.warn("[Supabase Sync] Network error:", e);
+  } finally {
+    isSyncingToSupabase = false;
+    if (hasPendingSync) {
+      setTimeout(syncStateToSupabase, 2000);
+    }
+  }
+}
+
+async function loadStateFromSupabase() {
+  if (!supabaseClient) return false;
+  
+  try {
+    const { data, error } = await supabaseClient
+      .from('crypto_advisor_state')
+      .select('portfolio, backtest')
+      .eq('id', 'default')
+      .single();
+      
+    if (error) {
+      console.warn("[Supabase Load] Fetch failed:", error.message);
+      return false;
+    }
+    
+    if (data && data.portfolio && data.backtest) {
+      portfolio = data.portfolio;
+      backtest = data.backtest;
+      
+      // Update local storage backup
+      localStorage.setItem('crypto_advisor_portfolio', JSON.stringify(portfolio));
+      localStorage.setItem('crypto_advisor_backtest', JSON.stringify(backtest));
+      
+      console.log("[Supabase Load] Cloud state loaded successfully.");
+      return true;
+    }
+  } catch (e) {
+    console.warn("[Supabase Load] Fetch failed (network error):", e);
+  }
+  return false;
+}
+
 // Fetch helper with timeout (GFW Protection)
 async function fetchWithTimeout(resource, options = {}) {
   const { timeout = 1500 } = options;
@@ -43,25 +157,30 @@ async function fetchWithTimeout(resource, options = {}) {
 }
 
 // Initial setup on page load
-window.addEventListener('DOMContentLoaded', () => {
-  // Load portfolio from LocalStorage
+window.addEventListener('DOMContentLoaded', async () => {
+  // Load portfolio from LocalStorage first (instant paint)
   loadPortfolio();
   loadBacktest();
 
-  // Set default values for inputs based on BTC
-  resetDefaults('BTC');
+  // Load persisted active account and token
+  const savedActiveToken = localStorage.getItem('crypto_advisor_active_token') || 'BTC';
+  const savedActiveAccount = localStorage.getItem('crypto_advisor_active_account') || 'manual';
+  
+  // Set activeToken to null temporarily so switchToken triggers and initializes UI
+  activeToken = null;
+  switchToken(savedActiveToken);
+  switchActiveAccount(savedActiveAccount);
   
   // Fetch initial API data
   fetchLivePrice();
   fetchFearAndGreed();
-  fetchAllLiveMetrics('BTC');
+  fetchAllLiveMetrics(activeToken);
   
   // Start intervals for live updates
   setInterval(fetchLivePrice, 5000); // Ticker price updates every 5s
   setInterval(fetchFearAndGreed, 3600000); // F&G updates hourly (since it changes daily)
   setInterval(() => {
-    const symbol = activeToken === 'BTC' ? 'BTC' : 'ETH';
-    fetchAllLiveMetrics(symbol);
+    fetchAllLiveMetrics(activeToken);
   }, 60000); // Sync all live metrics every 60s
   
   // Save portfolio and backtest state and update UI every 5s
@@ -77,12 +196,31 @@ window.addEventListener('DOMContentLoaded', () => {
     }
     updateRealtimeUnrealizedPnL();
   }, 5000);
+
+  // Background Cloud Sync Load:
+  // Fetch from Supabase and if newer/valid state exists, overwrite local and update UI
+  try {
+    const cloudLoaded = await loadStateFromSupabase();
+    if (cloudLoaded) {
+      // Re-trigger view states update to reflect cloud data
+      switchToken(savedActiveToken);
+      switchActiveAccount(savedActiveAccount);
+      renderBacktestComparisonTable();
+      renderPortfolioUI();
+      updateRealtimeUnrealizedPnL();
+      // Re-run offline backfill if cloud has different sync timestamp
+      triggerOfflineBackfill();
+    }
+  } catch (e) {
+    console.warn("Background cloud load failed, keeping local storage.", e);
+  }
 });
 
 // Switch between BTC and ETH
 function switchToken(token) {
   if (activeToken === token) return;
   activeToken = token;
+  localStorage.setItem('crypto_advisor_active_token', token);
   
   // Update button active state
   document.getElementById('btn-btc').classList.toggle('active', token === 'BTC');
@@ -1542,10 +1680,12 @@ function loadBacktest() {
 
 function savePortfolio() {
   localStorage.setItem('crypto_advisor_portfolio', JSON.stringify(portfolio));
+  syncStateToSupabase();
 }
 
 function saveBacktest() {
   localStorage.setItem('crypto_advisor_backtest', JSON.stringify(backtest));
+  syncStateToSupabase();
 }
 
 function resetPortfolioState() {
@@ -2002,6 +2142,7 @@ function syncBacktestOrders() {
 // Switch display account
 function switchActiveAccount(accountId) {
   activeAccountId = accountId;
+  localStorage.setItem('crypto_advisor_active_account', accountId);
   
   const rows = document.querySelectorAll('.backtest-comparison-table tbody tr');
   rows.forEach(r => r.classList.remove('active'));
