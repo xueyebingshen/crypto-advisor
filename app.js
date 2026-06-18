@@ -40,71 +40,79 @@ if (typeof supabase !== 'undefined') {
   console.warn("[Supabase Client] Library not loaded. Cloud sync is disabled.");
 }
 
+let syncDebounceTimer = null;
 let isSyncingToSupabase = false;
 let hasPendingSync = false;
 
-async function syncStateToSupabase() {
+function syncStateToSupabase() {
   if (!supabaseClient) return;
-  if (isSyncingToSupabase) {
-    hasPendingSync = true;
-    return;
-  }
+  if (syncDebounceTimer) clearTimeout(syncDebounceTimer);
   
-  isSyncingToSupabase = true;
-  hasPendingSync = false;
-  
-  try {
-    const statusSpan = document.querySelector('.live-pulse span');
-    let originalText = "";
-    if (statusSpan) {
-      originalText = statusSpan.innerText;
-      statusSpan.innerText = "正在同步云端数据...";
-      statusSpan.style.color = "var(--color-primary)";
+  syncDebounceTimer = setTimeout(async () => {
+    if (isSyncingToSupabase) {
+      hasPendingSync = true;
+      return;
     }
+    
+    isSyncingToSupabase = true;
+    hasPendingSync = false;
+    
+    try {
+      const statusSpan = document.querySelector('.live-pulse span');
+      let originalText = "";
+      if (statusSpan) {
+        originalText = statusSpan.innerText;
+        if (!statusSpan.innerText.includes("同步")) {
+          statusSpan.innerText = "正在同步云端数据...";
+          statusSpan.style.color = "var(--color-primary)";
+        }
+      }
 
-    const { error } = await supabaseClient
-      .from('crypto_advisor_state')
-      .upsert({
-        id: 'default',
-        portfolio: portfolio,
-        backtest: backtest,
-        updated_at: new Date().toISOString()
-      });
-      
-    if (error) {
-      console.warn("[Supabase Sync] Upload failed:", error.message);
-      if (statusSpan) {
-        statusSpan.innerText = "云端同步失败 (已用本地缓存)";
-        statusSpan.style.color = "var(--color-warning)";
-        setTimeout(() => {
-          if (statusSpan.innerText.includes("同步")) {
-            statusSpan.innerText = originalText;
-            statusSpan.style.color = "var(--color-success)";
-          }
-        }, 3000);
+      const { error } = await supabaseClient
+        .from('crypto_advisor_state')
+        .upsert({
+          id: 'default',
+          portfolio: portfolio,
+          backtest: backtest,
+          updated_at: new Date().toISOString()
+        });
+        
+      if (error) {
+        console.warn("[Supabase Sync] Upload failed:", error.message);
+        if (statusSpan) {
+          statusSpan.innerText = "云端同步失败 (已用本地缓存)";
+          statusSpan.style.color = "var(--color-warning)";
+          setTimeout(() => {
+            if (statusSpan.innerText.includes("同步")) {
+              statusSpan.innerText = originalText;
+              statusSpan.style.color = "var(--color-success)";
+            }
+          }, 3000);
+        }
+      } else {
+        console.log("[Supabase Sync] Upload succeeded.");
+        if (statusSpan) {
+          statusSpan.innerText = "云端数据已同步";
+          statusSpan.style.color = "var(--color-success)";
+          setTimeout(() => {
+            if (statusSpan.innerText.includes("云端")) {
+              statusSpan.innerText = originalText;
+              statusSpan.style.color = "var(--color-success)";
+            }
+          }, 2000);
+        }
       }
-    } else {
-      console.log("[Supabase Sync] Upload succeeded.");
-      if (statusSpan) {
-        statusSpan.innerText = "云端数据已同步";
-        statusSpan.style.color = "var(--color-success)";
-        setTimeout(() => {
-          if (statusSpan.innerText.includes("云端")) {
-            statusSpan.innerText = originalText;
-            statusSpan.style.color = "var(--color-success)";
-          }
-        }, 2000);
+    } catch (e) {
+      console.warn("[Supabase Sync] Network error:", e);
+    } finally {
+      isSyncingToSupabase = false;
+      if (hasPendingSync) {
+        syncStateToSupabase();
       }
     }
-  } catch (e) {
-    console.warn("[Supabase Sync] Network error:", e);
-  } finally {
-    isSyncingToSupabase = false;
-    if (hasPendingSync) {
-      setTimeout(syncStateToSupabase, 2000);
-    }
-  }
+  }, 200);
 }
+
 
 async function loadStateFromSupabase() {
   if (!supabaseClient) return false;
