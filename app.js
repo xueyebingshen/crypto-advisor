@@ -2469,11 +2469,18 @@ async function triggerOfflineBackfill() {
     return;
   }
   
+  // Adaptive K-line interval based on offline duration:
+  // < 1 day   → 1m  (covers ≈ 25h at 1500 limit)
+  // 1~7 days  → 1h  (covers ≈ 62 days at 1500 limit)
+  // 7~30 days → 4h  (covers ≈ 250 days at 1500 limit)
+  // > 30 days → 1d  (covers ≈ 4 years at 1500 limit)
   let interval = '1m';
-  if (timeDiff > 5 * 86400000) {
-    interval = '15m';
+  if (timeDiff > 30 * 86400000) {
+    interval = '1d';
+  } else if (timeDiff > 7 * 86400000) {
+    interval = '4h';
   } else if (timeDiff > 86400000) {
-    interval = '5m';
+    interval = '1h';
   }
   
   let totalOpened = 0;
@@ -2531,8 +2538,11 @@ async function triggerOfflineBackfill() {
     const banner = document.getElementById('sync-notification-banner');
     const bannerText = document.getElementById('sync-notification-text');
     if (banner && bannerText) {
-      const hours = (timeDiff / 3600000).toFixed(1);
-      bannerText.innerText = `检测到您曾离线 ${hours} 小时。系统已获取历史 K 线，自动为您撮合了 ${totalOpened} 笔挂单，平仓了 ${totalClosed} 笔持仓。后台 AI 回测系统同步撮合了 ${totalBacktestOpened} 笔挂单，平仓了 ${totalBacktestClosed} 笔持仓。`;
+      const days = (timeDiff / 86400000).toFixed(1);
+      const durationStr = timeDiff < 86400000
+        ? `${(timeDiff / 3600000).toFixed(1)} 小时`
+        : `${days} 天`;
+      bannerText.innerText = `检测到您曾离线 ${durationStr}（使用 ${interval} K线回溯）。系统已获取历史 K 线，自动为您撮合了 ${totalOpened} 笔挂单，平仓了 ${totalClosed} 笔持仓。后台 AI 回测系统同步撮合了 ${totalBacktestOpened} 笔挂单，平仓了 ${totalBacktestClosed} 笔持仓。`;
       banner.style.display = 'flex';
       setTimeout(() => {
         banner.style.display = 'none';
@@ -2543,15 +2553,25 @@ async function triggerOfflineBackfill() {
 
 async function fetchHistoricalKlines(symbol, interval, startTime, endTime) {
   const timeDiff = endTime - startTime;
-  let intervalMs = 60000;
-  if (interval === '5m') intervalMs = 300000;
-  if (interval === '15m') intervalMs = 900000;
+  // Map interval string to milliseconds for limit calculation
+  const intervalMsMap = {
+    '1m': 60000,
+    '5m': 300000,
+    '15m': 900000,
+    '1h': 3600000,
+    '4h': 14400000,
+    '1d': 86400000
+  };
+  const intervalMs = intervalMsMap[interval] || 60000;
   
-  const limit = Math.min(1000, Math.max(1, Math.ceil(timeDiff / intervalMs)));
+  // Max 1500 candles per request (Binance supports up to 1000, we cap here)
+  const limit = Math.min(1500, Math.max(1, Math.ceil(timeDiff / intervalMs)));
+  // Binance hard cap is 1000 per request
+  const binanceLimit = Math.min(1000, limit);
 
   // Try Primary: Binance Vision Sandbox (CORS-enabled & GFW-free developer endpoint)
   try {
-    const response = await fetchWithTimeout(`https://data-api.binance.vision/api/v3/klines?symbol=${symbol}USDT&interval=${interval}&limit=${limit}`, { timeout: 3000 });
+    const response = await fetchWithTimeout(`https://data-api.binance.vision/api/v3/klines?symbol=${symbol}USDT&interval=${interval}&limit=${binanceLimit}`, { timeout: 5000 });
     if (response.ok) return await response.json();
   } catch (e) {
     console.warn(`Binance Vision klines failed for offline sync. Trying backup...`, e.message);
@@ -2559,7 +2579,7 @@ async function fetchHistoricalKlines(symbol, interval, startTime, endTime) {
 
   // Try Backup 1: Binance API
   try {
-    const response = await fetchWithTimeout(`https://api.binance.com/api/v3/klines?symbol=${symbol}USDT&interval=${interval}&limit=${limit}`, { timeout: 3000 });
+    const response = await fetchWithTimeout(`https://api.binance.com/api/v3/klines?symbol=${symbol}USDT&interval=${interval}&limit=${binanceLimit}`, { timeout: 5000 });
     if (response.ok) return await response.json();
   } catch (e) {
     console.warn(`Binance primary klines failed for offline sync. Trying backup...`, e.message);
@@ -2567,16 +2587,19 @@ async function fetchHistoricalKlines(symbol, interval, startTime, endTime) {
   
   // Try Backup 2: Binance API 3
   try {
-    const response = await fetchWithTimeout(`https://api3.binance.com/api/v3/klines?symbol=${symbol}USDT&interval=${interval}&limit=${limit}`, { timeout: 3000 });
+    const response = await fetchWithTimeout(`https://api3.binance.com/api/v3/klines?symbol=${symbol}USDT&interval=${interval}&limit=${binanceLimit}`, { timeout: 5000 });
     if (response.ok) return await response.json();
   } catch (e) {
-    console.warn(`Binance API3 klines failed for offline sync. Trying Gate.io fallback...`, e.message);
+    console.warn(`Binance API3 klines failed for offline sync. Trying OKX fallback...`, e.message);
   }
 
-  // Try Backup 3: OKX Candlesticks
+  // Try Backup 3: OKX Candlesticks (supports up to 300 candles per request)
   try {
-    const okxLimit = Math.min(100, limit);
-    const response = await fetchWithTimeout(`https://www.okx.com/api/v5/market/candles?instId=${symbol}-USDT&bar=${interval}&limit=${okxLimit}`, { timeout: 3000 });
+    // Map interval to OKX bar format
+    const okxBarMap = { '1m': '1m', '5m': '5m', '15m': '15m', '1h': '1H', '4h': '4H', '1d': '1D' };
+    const okxBar = okxBarMap[interval] || '1m';
+    const okxLimit = Math.min(300, limit);
+    const response = await fetchWithTimeout(`https://www.okx.com/api/v5/market/history-candles?instId=${symbol}-USDT&bar=${okxBar}&limit=${okxLimit}`, { timeout: 5000 });
     if (response.ok) {
       const rawData = await response.json();
       if (rawData && rawData.data && Array.isArray(rawData.data)) {
