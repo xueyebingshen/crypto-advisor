@@ -426,9 +426,16 @@ async function fetchLivePrice() {
   }
   
   // Run one-time offline backfill check when initial price feed is loaded
+  // IMPORTANT: isOfflineSyncCompleted must only be set TRUE *after* the backfill
+  // completes, so syncBacktestOrders does not overwrite yesterday's locked order
+  // prices before the historical replay engine has a chance to match them.
   if (!isOfflineSyncCompleted && (btcPrice > 0 || ethPrice > 0)) {
-    isOfflineSyncCompleted = true;
-    setTimeout(triggerOfflineBackfill, 500);
+    setTimeout(async () => {
+      await triggerOfflineBackfill();
+      isOfflineSyncCompleted = true;
+      // Now that history is replayed, sync orders to current levels
+      syncBacktestOrders();
+    }, 500);
   }
 }
 
